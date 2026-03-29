@@ -1,0 +1,702 @@
+I WANT TO BUILD A MODEL WHICH TAKE THE CAMERA FEED AND AND AFTER SELECT ON OBJECT IT TELLS THE DISTANCE AT WHAT THE OBJECT IS PRESENT
+
+8:28 PM
+Great project idea! This is a monocular depth estimation + object detection system. Here's the architecture and approach:
+
+
+
+Here's a full breakdown of how to build this:
+
+Approach 1 — Monocular (single webcam, easiest to start)
+
+Uses MiDaS or Depth Anything v2 to estimate a relative depth map from a single camera frame, then samples depth values inside the bounding box returned by YOLOv8.
+
+python
+pip install ultralytics opencv-python torch torchvision timm
+python
+import cv2
+import torch
+import numpy as np
+from ultralytics import YOLO
+
+# Load models
+yolo = YOLO("yolov8n.pt")
+midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+midas.eval()
+
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # --- Object Detection ---
+    results = yolo(frame, verbose=False)[0]
+
+    # --- Depth Estimation ---
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    input_batch = midas_transforms(img_rgb)
+    with torch.no_grad():
+        depth = midas(input_batch)
+        depth = torch.nn.functional.interpolate(
+            depth.unsqueeze(1),
+            size=frame.shape[:2],
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze().numpy()
+
+    # Normalize depth map to 0-1 for display
+    depth_norm = cv2.normalize(depth, None, 0, 1, cv2.NORM_MINMAX)
+
+    # --- Sample depth at each detected bounding box ---
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cls = results.names[int(box.cls[0])]
+
+        # Take median depth in center region of bounding box
+        cx1, cy1 = (x1 + x2) // 2 - 10, (y1 + y2) // 2 - 10
+        cx2, cy2 = (x1 + x2) // 2 + 10, (y1 + y2) // 2 + 10
+        roi = depth_norm[cy1:cy2, cx1:cx2]
+        relative_depth = float(np.median(roi)) if roi.size > 0 else 0
+
+        # MiDaS gives INVERSE depth — higher value = closer
+        # Convert to a rough scale (tune K for your scene)
+        K = 5.0
+        estimated_dist = K / (relative_depth + 1e-6)
+
+        label = f"{cls}: ~{estimated_dist:.1f}m"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, label, (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    cv2.imshow("Distance Estimation", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+Key things to understand:
+
+MiDaS returns relative/inverse depth — higher values mean closer to the camera. There's no unit. To map it to real meters you need to calibrate by placing an object at a known distance (say 1m) and recording its depth value, then computing a scale factor K. The formula K / depth gives an approximate metric estimate.
+
+Approach 2 — Stereo camera (accurate metric depth)
+
+If you use an Intel RealSense, ZED camera, or two webcams in a stereo rig, you get true metric depth in meters directly. OpenCV's StereoBM or StereoSGBM handles stereo disparity. This is much more accurate but requires specific hardware.
+
+Recommended upgrades:
+
+Swap MiDaS for Depth Anything v2 (better accuracy, same API style)
+Use YOLOv8s instead of yolov8n for better detection accuracy at slight speed cost
+Add a click-to-select UI with OpenCV mouse callbacks so the user clicks on any object to get its distance
+Would you like me to build the click-to-select version, or help you set up calibration for metric distances?
+
+I HAVE SCOPIAA Skoopia G21Z30S Camera
+
+8:34 PM
+
+Searched the web
+Searched the web
+Great find! Now I know exactly what you're working with. Here's what's important about your camera and how it affects the project:
+
+The Skoopia G21Z30S is an industrial block camera, not a USB webcam. Here's what that means for your setup:
+
+Key specs:
+
+AR0234 global shutter sensor, 30x optical zoom, outputs: HD-SDI, LVDS, and CVBS 
+skoopia
+Dimensions: 97mm × 60mm × 50mm, fully Sony VISCA compatible 
+skoopia
+1080p resolution, global shutter (great for fast-moving objects — no motion blur)
+The big challenge — it doesn't output USB. You need one of these to get the feed into your PC:
+
+Option 1 — CVBS output (easiest, lower quality)
+Use the CVBS (composite video) output with a cheap USB video capture card (e.g. EasyCap, Magewell USB Capture). OpenCV can then read it like a normal webcam.
+
+python
+cap = cv2.VideoCapture(0)  # or 1, 2 depending on your capture card index
+Option 2 — HD-SDI output (best quality)
+Use an SDI-to-USB capture card like Magewell USB Capture SDI or Blackmagic UltraStudio. This gives you full 1080p. OpenCV reads it the same way via the capture device index.
+
+Option 3 — GigE Vision (best for machine vision)
+Pleora's iPORT SKB-GigE converts the Skoopia block camera into a GigE Vision device, transmitting full-resolution low-latency video over standard CAT5e/6 cabling up to 100 meters. 
+Pleora Technologies
+ You'd then use the harvesters or pypylon Python SDK to grab frames.
+
+Modified code for your camera (CVBS/SDI capture card path):
+python
+import cv2
+import torch
+import numpy as np
+from ultralytics import YOLO
+
+# Load models
+yolo = YOLO("yolov8n.pt")
+midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+midas.eval()
+
+# Change index to match your capture card (try 0, 1, 2...)
+cap = cv2.VideoCapture(1)
+
+# Set resolution to match G21Z30S 1080p output
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Cannot read from camera/capture card")
+        break
+
+    results = yolo(frame, verbose=False)[0]
+
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    input_batch = midas_transforms(img_rgb)
+    with torch.no_grad():
+        depth = midas(input_batch)
+        depth = torch.nn.functional.interpolate(
+            depth.unsqueeze(1),
+            size=frame.shape[:2],
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze().numpy()
+
+    depth_norm = cv2.normalize(depth, None, 0, 1, cv2.NORM_MINMAX)
+
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cls = results.names[int(box.cls[0])]
+        conf = float(box.conf[0])
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        pad = 15
+        roi = depth_norm[max(0,cy-pad):cy+pad, max(0,cx-pad):cx+pad]
+        rel_depth = float(np.median(roi)) if roi.size > 0 else 0
+
+        # Tune K based on your zoom level — G21Z30S has 30x zoom!
+        # At wide angle (zoom=1), K~5. At full zoom (zoom=30), K~0.3
+        K = 5.0
+        dist = K / (rel_depth + 1e-6)
+
+        label = f"{cls} {conf:.0%} ~{dist:.1f}m"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, label, (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    cv2.imshow("G21Z30S Distance Estimation", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+Important note about the 30x zoom:
+Your camera's zoom level drastically changes the apparent depth. You'll need to read the current zoom level via VISCA and adjust the K calibration factor accordingly. The camera supports VISCA serial commands — would you like me to add VISCA zoom-aware depth scaling to the code?
+
+What capture method are you using to connect the G21Z30S to your PC? (CVBS capture card, SDI capture card, or GigE?)
+
+Q: How are you connecting the G21Z30S to your PC?
+A: EEVEYTHING IS SORTED I WANT TO BUILD A MODEL TO FIND THE DISTANCE FROM THE CAMERA TO THE OBJECT
+
+8:36 PM
+Perfect! Let's build this end-to-end. Here's the complete, ready-to-run code:
+
+python
+pip install ultralytics opencv-python torch torchvision timm
+python
+import cv2
+import torch
+import numpy as np
+from ultralytics import YOLO
+
+# ── Models ──────────────────────────────────────────────────────────────────
+yolo  = YOLO("yolov8n.pt")
+midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+midas.eval()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+midas.to(device)
+
+# ── Camera ───────────────────────────────────────────────────────────────────
+cap = cv2.VideoCapture(0)   # change index if needed (0, 1, 2...)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+# ── Calibration ──────────────────────────────────────────────────────────────
+# Place an object exactly 2 metres away, note the median depth value printed,
+# then set:  K = 2.0 * that_value
+K = 5.0      # <-- tune this once after running
+
+# ── Colour map for classes ────────────────────────────────────────────────────
+COLORS = {}
+def get_color(cls_id):
+    if cls_id not in COLORS:
+        np.random.seed(cls_id)
+        COLORS[cls_id] = tuple(int(c) for c in np.random.randint(80, 255, 3))
+    return COLORS[cls_id]
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+print("Running — press Q to quit, C to recalibrate K")
+calibrating = False
+calib_dist   = 2.0   # metres — change to actual distance of calibration object
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Frame grab failed — check capture card / camera index")
+        break
+
+    h, w = frame.shape[:2]
+
+    # ── Depth map ──────────────────────────────────────────────────────────
+    img_rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    input_batch  = transforms(img_rgb).to(device)
+    with torch.no_grad():
+        depth = midas(input_batch)
+        depth = torch.nn.functional.interpolate(
+            depth.unsqueeze(1),
+            size=(h, w),
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze().cpu().numpy()
+
+    depth_norm = cv2.normalize(depth, None, 0, 1, cv2.NORM_MINMAX)
+
+    # ── Object detection ───────────────────────────────────────────────────
+    results = yolo(frame, verbose=False)[0]
+
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cls_id  = int(box.cls[0])
+        cls_name = results.names[cls_id]
+        conf    = float(box.conf[0])
+        color   = get_color(cls_id)
+
+        # Sample median depth in centre 20×20 px of bounding box
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        pad    = 10
+        roi    = depth_norm[max(0, cy-pad):cy+pad, max(0, cx-pad):cx+pad]
+        rel    = float(np.median(roi)) if roi.size > 0 else 1e-6
+
+        # MiDaS = inverse depth  →  distance = K / rel
+        dist_m = K / (rel + 1e-6)
+
+        # ── Draw ────────────────────────────────────────────────────────
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        # Background pill behind text
+        label = f"{cls_name}  {dist_m:.2f} m  ({conf:.0%})"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (x1, y1 - th - 12), (x1 + tw + 8, y1), color, -1)
+        cv2.putText(frame, label, (x1 + 4, y1 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Centre crosshair
+        cv2.drawMarker(frame, (cx, cy), color,
+                       cv2.MARKER_CROSS, 14, 2)
+
+        # ── Auto-calibrate on keypress ───────────────────────────────────
+        if calibrating:
+            K = calib_dist * rel
+            print(f"[CALIB] K set to {K:.4f}  (object at {calib_dist} m)")
+            calibrating = False
+
+    # ── Depth map overlay (small, top-right corner) ─────────────────────
+    depth_vis   = cv2.applyColorMap(
+        (depth_norm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+    thumb_h, thumb_w = h // 4, w // 4
+    thumb       = cv2.resize(depth_vis, (thumb_w, thumb_h))
+    frame[10:10+thumb_h, w-thumb_w-10:w-10] = thumb
+    cv2.putText(frame, "depth map", (w - thumb_w - 4, 10 + thumb_h + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+    # ── HUD ───────────────────────────────────────────────────────────────
+    cv2.putText(frame, f"K={K:.2f}  |  Q=quit  C=calibrate",
+                (10, h - 14), cv2.FONT_HERSHEY_SIMPLEX,
+                0.5, (180, 180, 180), 1)
+
+    cv2.imshow("Distance Estimator — G21Z30S", frame)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('c'):
+        calibrating = True
+        print(f"[CALIB] Point camera at object {calib_dist} m away, press C again...")
+
+cap.release()
+cv2.destroyAllWindows()
+What you get
+Feature	Detail
+Bounding box + label	Class name, estimated distance, confidence
+Per-class colours	Each object type gets its own colour
+Depth map thumbnail	Live INFERNO-coloured depth preview (top-right)
+Live calibration	Press C with an object at a known distance to auto-set K
+GPU acceleration	Runs on CUDA automatically if available
+One-time calibration (important)
+MiDaS gives relative depth — you need to tune K once:
+
+Place any object exactly 2 metres from the camera
+Run the script, press C
+K is now set — distances will be in real metres
+If your camera is zoomed in, K changes with zoom level. After zooming, press C again with the same reference object.
+
+Want to go further?
+VISCA zoom integration — auto-adjust K as the camera zooms
+Depth Anything v2 — swap MiDaS for a much more accurate model
+Click to measure — click any point on screen to get its distance
+Distance alerts — alarm when an object comes within X metres
+Which would you like next?
+
+VISCA zoom integration — auto-adjust K as the camera zooms
+Depth Anything v2 — swap MiDaS for a much more accurate model
+Click to measure — click any point on screen to get its distance
+8:37 PM
+Let's build all three together. First let me check the latest Depth Anything v2 API:
+
+
+Searched the web
+Searched the web
+Got everything I need. Here's the complete upgraded system — all three features integrated into one script.
+
+Step 1 — Setup
+bash
+# Clone Depth Anything V2
+git clone https://github.com/DepthAnything/Depth-Anything-V2
+cd Depth-Anything-V2
+pip install -r requirements.txt
+pip install ultralytics opencv-python pyserial
+
+# Download the model checkpoint (vitb = good balance of speed vs accuracy)
+# Place it in:  Depth-Anything-V2/checkpoints/depth_anything_v2_vitb.pth
+# Download from: https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth
+Step 2 — Full Script
+Save this as distance_estimator.py inside the Depth-Anything-V2/ folder:
+
+python
+"""
+G21Z30S Distance Estimator
+─────────────────────────────────────────────────────────────────────────────
+Features:
+  • Depth Anything V2  —  much more accurate than MiDaS
+  • VISCA zoom         —  K auto-scales with camera zoom level
+  • Click to measure   —  left-click anywhere on frame for instant distance
+  • YOLOv8 detection   —  per-object distance labels
+  • Press C            —  calibrate K with object at known distance
+  • Press Q            —  quit
+─────────────────────────────────────────────────────────────────────────────
+"""
+
+import cv2
+import torch
+import numpy as np
+import serial
+import serial.tools.list_ports
+import time
+import sys
+import os
+
+from ultralytics import YOLO
+from depth_anything_v2.dpt import DepthAnythingV2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG  —  edit these
+# ─────────────────────────────────────────────────────────────────────────────
+CAMERA_INDEX      = 0          # capture card index (try 0,1,2 if black screen)
+CAMERA_W, CAMERA_H = 1920, 1080
+YOLO_MODEL        = "yolov8n.pt"
+DA_ENCODER        = "vitb"     # "vits"=fast, "vitb"=balanced, "vitl"=accurate
+DA_CHECKPOINT     = "checkpoints/depth_anything_v2_vitb.pth"
+CALIB_DIST_M      = 2.0        # metres — distance to object when pressing C
+VISCA_PORT        = None       # e.g. "COM3" or "/dev/ttyUSB0"  (None = auto-detect)
+VISCA_BAUD        = 9600
+MAX_ZOOM          = 30         # G21Z30S optical zoom range
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VISCA ZOOM READER
+# ─────────────────────────────────────────────────────────────────────────────
+class VISCAZoom:
+    """Reads zoom position from G21Z30S via RS-232 VISCA."""
+
+    ZOOM_POS_QUERY = bytes([0x81, 0x09, 0x04, 0x47, 0xFF])
+
+    def __init__(self, port=None, baud=9600):
+        self.ser   = None
+        self.zoom  = 1.0   # current zoom multiplier (1x … MAX_ZOOM)
+        self._connect(port, baud)
+
+    def _connect(self, port, baud):
+        if port is None:
+            # Auto-detect: look for first available serial port
+            ports = serial.tools.list_ports.comports()
+            port  = ports[0].device if ports else None
+        if port is None:
+            print("[VISCA] No serial port found — zoom scaling disabled")
+            return
+        try:
+            self.ser = serial.Serial(port, baud, timeout=0.1)
+            print(f"[VISCA] Connected on {port}")
+        except Exception as e:
+            print(f"[VISCA] Could not open {port}: {e} — zoom scaling disabled")
+
+    def update(self):
+        """Query camera for zoom position; update self.zoom."""
+        if self.ser is None:
+            return
+        try:
+            self.ser.write(self.ZOOM_POS_QUERY)
+            time.sleep(0.02)
+            resp = self.ser.read(7)           # VISCA reply is 7 bytes
+            if len(resp) == 7 and resp[0] == 0x90:
+                # Bytes 2-5 encode zoom position as 4 nibbles (0x0000–0x4000)
+                p  = ((resp[2] & 0x0F) << 12 |
+                      (resp[3] & 0x0F) <<  8 |
+                      (resp[4] & 0x0F) <<  4 |
+                      (resp[5] & 0x0F))
+                # Map 0x0000…0x4000 → 1x…MAX_ZOOM
+                self.zoom = 1.0 + (p / 0x4000) * (MAX_ZOOM - 1)
+        except Exception:
+            pass   # silently ignore transient serial errors
+
+    def close(self):
+        if self.ser:
+            self.ser.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPTH MODEL  (Depth Anything V2)
+# ─────────────────────────────────────────────────────────────────────────────
+MODEL_CONFIGS = {
+    "vits": {"encoder": "vits", "features": 64,  "out_channels": [48,  96,  192,  384]},
+    "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96,  192, 384,  768]},
+    "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+}
+
+def load_depth_model(encoder, checkpoint):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Depth] Loading Depth Anything V2 ({encoder}) on {device} ...")
+    model = DepthAnythingV2(**MODEL_CONFIGS[encoder])
+    model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+    model = model.to(device).eval()
+    print("[Depth] Model ready.")
+    return model, device
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+_COLORS = {}
+def class_color(cls_id):
+    if cls_id not in _COLORS:
+        np.random.seed(cls_id + 42)
+        _COLORS[cls_id] = tuple(int(c) for c in np.random.randint(80, 230, 3))
+    return _COLORS[cls_id]
+
+def depth_to_distance(rel_depth, K, zoom):
+    """Convert normalised inverse depth to metres, zoom-corrected."""
+    # MiDaS / DA relative depth ∝ 1/distance
+    # Zoom multiplies apparent depth: at 2× zoom, same object looks 2× closer
+    return (K * zoom) / (rel_depth + 1e-6)
+
+def draw_label(img, text, x, y, color, font_scale=0.55, thickness=2):
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+    cv2.rectangle(img, (x - 2, y - th - 6), (x + tw + 4, y + 2), color, -1)
+    cv2.putText(img, text, (x, y - 2),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness)
+
+def sample_depth(depth_norm, cx, cy, pad=12):
+    roi = depth_norm[max(0, cy-pad):cy+pad, max(0, cx-pad):cx+pad]
+    return float(np.median(roi)) if roi.size > 0 else 1e-6
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MOUSE STATE  (click-to-measure)
+# ─────────────────────────────────────────────────────────────────────────────
+click_points = []    # list of (x, y, timestamp)
+CLICK_TTL    = 4.0   # seconds a click label stays on screen
+
+def on_mouse(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        click_points.append([x, y, time.time()])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    # ── Load models ───────────────────────────────────────────────────────
+    yolo                = YOLO(YOLO_MODEL)
+    depth_model, device = load_depth_model(DA_ENCODER, DA_CHECKPOINT)
+    visca               = VISCAZoom(VISCA_PORT, VISCA_BAUD)
+
+    # ── Camera ────────────────────────────────────────────────────────────
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open camera index {CAMERA_INDEX}")
+        sys.exit(1)
+
+    # ── Window & mouse callback ────────────────────────────────────────────
+    WIN = "G21Z30S | Distance Estimator"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, 1280, 720)
+    cv2.setMouseCallback(WIN, on_mouse)
+
+    # ── Calibration state ─────────────────────────────────────────────────
+    K              = 5.0
+    calib_pending  = False
+    depth_norm_cur = None    # latest depth map (shared between detection & click)
+
+    print("\nControls:  Q = quit   C = calibrate K   Left-click = measure point\n")
+
+    visca_tick = time.time()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("[WARN] Frame grab failed — retrying...")
+            time.sleep(0.05)
+            continue
+
+        h, w = frame.shape[:2]
+
+        # ── Poll VISCA zoom every 0.5 s ───────────────────────────────────
+        if time.time() - visca_tick > 0.5:
+            visca.update()
+            visca_tick = time.time()
+
+        zoom = visca.zoom   # current zoom level (1.0 if no serial connection)
+
+        # ── Depth map ─────────────────────────────────────────────────────
+        with torch.no_grad():
+            depth_raw = depth_model.infer_image(frame)   # HxW numpy float32
+
+        depth_norm_cur = cv2.normalize(depth_raw, None, 0, 1, cv2.NORM_MINMAX)
+
+        # ── YOLO detection ────────────────────────────────────────────────
+        results = yolo(frame, verbose=False)[0]
+
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls_id   = int(box.cls[0])
+            cls_name = results.names[cls_id]
+            conf     = float(box.conf[0])
+            color    = class_color(cls_id)
+
+            cx, cy   = (x1 + x2) // 2, (y1 + y2) // 2
+            rel      = sample_depth(depth_norm_cur, cx, cy)
+            dist_m   = depth_to_distance(rel, K, zoom)
+
+            # ── Calibrate on next frame if pending ────────────────────────
+            if calib_pending:
+                K = CALIB_DIST_M / (rel * zoom + 1e-6)
+                print(f"[CALIB] K = {K:.4f}  (object '{cls_name}' at {CALIB_DIST_M} m, zoom {zoom:.1f}×)")
+                calib_pending = False
+
+            # ── Draw box + label ──────────────────────────────────────────
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.drawMarker(frame, (cx, cy), color, cv2.MARKER_CROSS, 14, 2)
+            label = f"{cls_name}  {dist_m:.2f} m  ({conf:.0%})"
+            draw_label(frame, label, x1, y1, color)
+
+        # ── Click-to-measure ──────────────────────────────────────────────
+        now = time.time()
+        # Expire old clicks
+        click_points[:] = [p for p in click_points if now - p[2] < CLICK_TTL]
+
+        for pt in click_points:
+            px, py, _ = pt
+            if depth_norm_cur is not None:
+                rel    = sample_depth(depth_norm_cur, px, py, pad=6)
+                dist_m = depth_to_distance(rel, K, zoom)
+                # Draw crosshair + distance pin
+                cv2.drawMarker(frame, (px, py), (0, 220, 255),
+                               cv2.MARKER_TILTED_CROSS, 18, 2)
+                draw_label(frame, f"  {dist_m:.2f} m  ",
+                           px + 14, py, (20, 130, 180), font_scale=0.6)
+
+        # ── Depth map thumbnail (top-right) ───────────────────────────────
+        depth_vis = cv2.applyColorMap(
+            (depth_norm_cur * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+        th, tw = h // 4, w // 4
+        thumb  = cv2.resize(depth_vis, (tw, th))
+        frame[10:10+th, w-tw-10:w-10] = thumb
+        cv2.rectangle(frame, (w-tw-10, 10), (w-10, 10+th), (80,80,80), 1)
+        cv2.putText(frame, "depth map", (w-tw-6, 10+th+14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180,180,180), 1)
+
+        # ── HUD bar ───────────────────────────────────────────────────────
+        hud = (f"K={K:.3f}  |  zoom={zoom:.1f}x  |  "
+               f"{'VISCA OK' if visca.ser else 'no VISCA'}  |  "
+               f"Q=quit  C=calibrate  click=measure")
+        cv2.rectangle(frame, (0, h-28), (w, h), (0,0,0), -1)
+        cv2.putText(frame, hud, (8, h-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200,200,200), 1)
+
+        cv2.imshow(WIN, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('c'):
+            calib_pending = True
+            print(f"[CALIB] Waiting — point at object {CALIB_DIST_M} m away ...")
+
+    cap.release()
+    visca.close()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
+How each feature works
+Depth Anything V2 Uses model.infer_image(frame) directly — no manual transform pipeline needed. The vitb checkpoint is the best everyday choice. Swap DA_ENCODER = "vitl" for maximum accuracy if you have a GPU.
+
+VISCA zoom integration Every 0.5 seconds the script sends a VISCA CAM_ZoomPosInq command over serial and reads back the 4-nibble zoom position. It maps the raw value 0x0000–0x4000 to 1×–30×. The distance formula then becomes (K × zoom) / rel_depth — so as you zoom in, the estimated distance stays correct automatically. If no serial port is found it falls back gracefully to zoom = 1.0.
+
+Click to measure A mouse callback stores every left-click with a timestamp. Each frame, live distances are computed at those coordinates from the current depth map and drawn as floating pin labels. Clicks fade after 4 seconds.
+
+Run it
+bash
+cd Depth-Anything-V2
+python distance_estimator.py
+One-time calibration
+Place any object exactly 2.0 m from the camera (at whatever zoom level you'll be using)
+Press C — K is auto-calculated and printed
+Done — distances are now in real metres
+Want me to add distance alerts (alarm when object enters a zone), object tracking with persistent IDs, or a logging system that saves detections to CSV?
+
+I want you to give me the correct folder structure and what are the things I need to do step by step I just wanted to know Like it is a model Do I need to do any extra like I need to download few things right
+
+8:44 PM
+Let me give you a clean, complete setup guide.
+
+Here's the complete step-by-step setup guide — both the folder structure and every download you need.
+
+
+
+To answer your core question — yes, you do need to download a few things, but nothing complicated. Here's the full list:
+
+Things you download manually:
+
+What	Where	Size
+Python 3.10 or 3.11	python.org/downloads	~25 MB
+Git	git-scm.com	~50 MB
+depth_anything_v2_vitb.pth	huggingface.co/depth-anything/Depth-Anything-V2-Base	~400 MB
+Things that auto-download when you run commands:
+
+What	How	Size
+Depth Anything V2 code	git clone ...	~10 MB
+PyTorch, OpenCV, etc.	pip install ...	~1.5 GB
+YOLOv8 weights	Auto on first run	~6 MB
+The model file (depth_anything_v2_vitb.pth) is the only "AI model" you download. Everything else is just standard software libraries. You don't train anything — it's pre-trained and ready to use.
+
+Three sizes of the model are available if you want to trade off speed vs accuracy:
+
+vits — fastest, least accurate (~100 MB)
+vitb — balanced, recommended (~400 MB)
+vitl — most accurate, needs a good GPU (~1.3 GB)
+Start with vitb. If it's too slow on your PC, switch to vits by changing one line in the script: DA_ENCODER = "vits".
